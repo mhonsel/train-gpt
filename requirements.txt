@@ -1,0 +1,6 @@
+numpy==2.2.1
+tiktoken==0.8.0
+torch==2.5.1
+requests~=2.32.3
+tqdm~=4.67.1
+transformers~=4.47.1
