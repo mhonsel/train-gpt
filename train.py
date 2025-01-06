@@ -7,16 +7,17 @@ import torch.distributed as dist
 
 from dataloader import DataLoaderLite
 from hellaswag import render_example, iterate_examples, get_most_likely_row
-from model import GPT, GPTConfig
+from model import GPT, GPTConfig, generate
 from torch.distributed import init_process_group, destroy_process_group
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 
 # -----------------------------------------------------------------------------
+# hyperparameters
 total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
-B = 16  # micro batch size (as big as GPU can handle)
+B = 16  # micro batch size (per GPU, make as big as GPU can handle)
 T = 1024  # sequence length
+vocab_size = 50304 # increase vocab_size to make a nice number
 log_dir = "log"
 resume_training = False
 use_compile = True
@@ -24,15 +25,16 @@ max_lr = 6e-4 * 2  # gpt-3 paper: 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 200  # gpt-3 paper: 715
 max_steps = 19073
-eval_step = 5  # 250
-checkpoint_step = 5  # 5000
+eval_interval = 5  # 250
+validation_steps = 20
+checkpoint_interval = 5  # 5000
 # -----------------------------------------------------------------------------
 
 
 # simple launch:
-# python train_gpt2.py
+# python train.py
 # DDP launch for e.g. 8 GPUs:
-# torchrun --standalone --nproc_per_node=8 train_gpt2.py
+# torchrun --standalone --nproc_per_node=8 train.py
 
 
 # set up DDP (distributed data parallel).
@@ -58,12 +60,14 @@ else:
     device = 'cpu'
     if torch.cuda.is_available():
         device = 'cuda'
-    #elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
     elif torch.mps.is_available():
         device = 'mps'
     print(f'using device: {device}')
 
 device_type = 'cuda' if device.startswith('cuda') else 'cpu'
+
+if device_type != 'cuda':
+    total_batch_size = B * T  # DEBUG: print each step
 
 torch.manual_seed(1337)
 if torch.cuda.is_available():
@@ -73,13 +77,9 @@ elif torch.mps.is_available():
 
 enc = tiktoken.get_encoding("gpt2")
 
-
-if device_type != 'cuda':
-    total_batch_size = total_batch_size // 32  # DEBUG
-
 assert total_batch_size % (B * T * ddp_world_size) == 0, 'make sure total_batch_size is divisible by B * T * ddp_world_size'
 grad_accum_steps = total_batch_size // (B * T * ddp_world_size)
-if master_process:  # print single time
+if master_process:
     print(f'total desired batch size: {total_batch_size}')
     print(f'=> calculated gradient accumulation steps: {grad_accum_steps}')
 
@@ -116,7 +116,7 @@ if resume_training:
         print(f"resuming training from step {current_step} with a validation loss of {checkpoint['val_loss']:.4f}")
 else:
     # create model
-    model = GPT(GPTConfig(vocab_size=50304)) # increase vocabsize to make it have more factors of 2
+    model = GPT(GPTConfig(vocab_size=vocab_size))
     model.to(device)
     current_step = 0
     optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
@@ -157,29 +157,28 @@ def get_lr(step):
 # training loop
 for step in range(max_steps):
     t0 = time.time()
-    last_step = (step == max_steps -1)
+    last_step = (step == max_steps - 1)
 
-    # once in a while evaluate our validation loss
-    if step % eval_step == 0 or last_step:
+    # evaluate validation loss
+    if step % eval_interval == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
             val_loss_accum = 0.0
-            val_loss_steps = 20
-            for _ in range(val_loss_steps):
+            for _ in range(validation_steps):
                 x, y = val_loader.next_batch()
                 x, y = x.to(device), y.to(device)
                 with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
                     logits, loss = model(x, y)
                 val_loss_accum += loss.detach()
-            val_loss_accum /= val_loss_steps # diff from Andrej - less prone to floating point errors: https://github.com/karpathy/build-nanogpt/pull/19/files
+            val_loss_accum /= validation_steps # diff from Andrej - less prone to floating point errors
         if ddp:
             dist.all_reduce(val_loss_accum, op=dist.ReduceOp.AVG)
         if master_process:
             print(f'validation loss: {val_loss_accum.item():.4f}')
             with open(log_file, 'a') as f:
                 f.write(f'{step} val {val_loss_accum.item():.4f}\n')
-            if step > 0 and (step % checkpoint_step == 0 or last_step):
+            if step > 0 and (step % checkpoint_interval == 0 or last_step):
                 # write model checkpoints
                 train_loader_checkpoint = {'current_shard': train_loader.current_shard,
                                            'current_position': train_loader.current_position}
@@ -195,8 +194,8 @@ for step in range(max_steps):
                 }
                 torch.save(checkpoint, checkpoint_path)
 
-    # once in a while evaluate hellaswag
-    if (step % eval_step == 0 or last_step) and (not use_compile):
+    # evaluate hellaswag
+    if step % eval_interval == 0 or last_step:
         num_correct_norm = 0
         num_total = 0
         # Use unwrapped (uncompiled) model for evaluation
@@ -232,40 +231,11 @@ for step in range(max_steps):
                 f.write(f"{step} hella {acc_norm:.4f}\n")
 
     # once in a while generate from the model (except step 0, which is noise)
-    if ((step > 0 and step % eval_step == 0) or last_step) and (not use_compile):
-        model.eval()
-        num_return_sequences = 4
-        max_length = 32
-        tokens = enc.encode("Hello, I'm a language model,")
-        tokens = torch.tensor(tokens, dtype=torch.long)
-        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
-        xgen = tokens.to(device)
-        sample_rng = torch.Generator(device=device)
-        sample_rng.manual_seed(42 + ddp_rank)
-        while xgen.size(1) < max_length:
-            # forward the model to get the logits
-            with torch.no_grad():
-                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-                    logits, loss = model(xgen) # (B, T, vocab_size)
-                # take the logits at the last position
-                logits = logits[:, -1, :] # (B, vocab_size)
-                # get the probabilities
-                probs = F.softmax(logits, dim=-1)
-                # do top-k sampling of 50 (huggingface pipeline default)
-                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
-                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
-                # select a token from the top-k probabilities
-                # note: multinomial does not demand the input to sum to 1
-                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
-                # gather the corresponding indices
-                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
-                # append to the sequence
-                xgen = torch.cat((xgen, xcol), dim=1)
-        # print the generated text
-        for i in range(num_return_sequences):
-            tokens = xgen[i, :max_length].tolist()
-            decoded = enc.decode(tokens)
-            print(f"rank {ddp_rank} sample {i}: {decoded}")
+    if (step > 0 and step % eval_interval == 0) or last_step:
+        samples = generate(model=model, encoder=enc, prompt="Hello, I'm a language model,",
+                           seed=(42 + ddp_rank), device=device)
+        for i, sample in enumerate(samples):
+            print(f"rank {ddp_rank} sample {i}: {sample}")
 
     # do one step of the optimization
     model.train()
@@ -298,14 +268,12 @@ for step in range(max_steps):
     optimizer.step()
     if device_type == 'cuda':
         torch.cuda.synchronize()
-    elif device == 'mps':
-        torch.mps.synchronize()
     t1 = time.time()
     dt = t1 - t0  # time difference in seconds
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps * ddp_world_size
     tokens_per_sec = tokens_processed / dt
     if master_process:
-        print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/sec: {tokens_per_sec:.2f}")
+        print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/s: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
 

@@ -1,4 +1,5 @@
 import inspect
+import tiktoken
 import torch
 import torch.nn as nn
 
@@ -198,3 +199,38 @@ class GPT(nn.Module):
             print(f"using fused AdamW: {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
+
+@torch.no_grad()
+def generate(model: GPT, encoder: tiktoken.Encoding, prompt: str, seed=42, n_samples=4, max_length=32, device='cpu'):
+    device_type = 'cuda' if device.startswith('cuda') else 'cpu'
+    model.eval()
+    tokens = encoder.encode("Hello, I'm a language model,")
+    tokens = torch.tensor(tokens, dtype=torch.long)
+    tokens = tokens.unsqueeze(0).repeat(n_samples, 1)
+    xgen = tokens.to(device)
+    sample_rng = torch.Generator(device=device)
+    sample_rng.manual_seed(seed)
+    while xgen.size(1) < max_length:
+        # forward the model to get the logits
+        with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+            logits, loss = model(xgen)  # (B, T, vocab_size)
+        # take the logits at the last position
+        logits = logits[:, -1, :]  # (B, vocab_size)
+        # get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        # do top-k sampling of 50 (huggingface pipeline default)
+        # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+        topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+        # select a token from the top-k probabilities
+        # note: multinomial does not demand the input to sum to 1
+        ix = torch.multinomial(topk_probs, 1, generator=sample_rng)  # (B, 1)
+        # gather the corresponding indices
+        xcol = torch.gather(topk_indices, -1, ix)  # (B, 1)
+        # append to the sequence
+        xgen = torch.cat((xgen, xcol), dim=1)
+    # print the generated text
+    samples = []
+    for i in range(n_samples):
+        tokens = xgen[i, :max_length].tolist()
+        samples.append(encoder.decode(tokens))
+    return samples
