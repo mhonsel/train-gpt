@@ -8,8 +8,18 @@ import torch.distributed as dist
 from dataloader import DataLoaderLite
 from hellaswag import render_example, iterate_examples, get_most_likely_row
 from model import GPT, GPTConfig, generate
+from pathlib import Path
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+# -----------------------------------------------------------------------------
+# hugging face
+use_huggingface = True
+dataset_repo = "mhonsel/edu_fineweb10B_tokens"
+dataset_dir = "./edu_fineweb10B/"
+model_repo = "mhonsel/gpt2_124M"
+# -----------------------------------------------------------------------------
 
 
 # -----------------------------------------------------------------------------
@@ -24,9 +34,10 @@ use_compile = True
 max_lr = 6e-4 * 2  # gpt-3 paper: 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 200  # gpt-3 paper: 715
-max_steps = 19073
+max_steps = 6  # 19073
 eval_interval = 5  # 250
 validation_steps = 20
+hellaswag_eval = True
 checkpoint_interval = 5  # 5000
 # -----------------------------------------------------------------------------
 
@@ -35,6 +46,17 @@ checkpoint_interval = 5  # 5000
 # python train.py
 # DDP launch for e.g. 8 GPUs:
 # torchrun --standalone --nproc_per_node=8 train.py
+
+
+# need generate hf token using `huggingface-cli login` before running train.py
+if use_huggingface:
+    from huggingface_hub import HfApi
+    from hf_data import download, upload
+
+    hf_api = HfApi()
+    futures = []
+    token = Path.home() / '.cache/huggingface/token'
+    assert token.exists(), "Run `huggingface-cli login` to generate token first"
 
 
 # set up DDP (distributed data parallel).
@@ -83,30 +105,38 @@ if master_process:
     print(f'total desired batch size: {total_batch_size}')
     print(f'=> calculated gradient accumulation steps: {grad_accum_steps}')
 
+# download dataset from huggingface
+if use_huggingface:
+    if master_process:
+        download(dataset_repo=dataset_repo, dataset_dir=dataset_dir)
+    if ddp:
+        dist.barrier()  # ensure all processes wait for completion of the download
+
 train_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='train', verbose=master_process)
 val_loader = DataLoaderLite(B=B, T=T, process_rank=ddp_rank, num_processes=ddp_world_size, split='val', verbose=master_process)
 
 torch.set_float32_matmul_precision('high')  # only on cuda: reduce internal precision of matmul
 
 # Create a log directory for writing checkpoints and logging
-os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f"log.txt")
+log_dir = Path(log_dir)
+log_dir.mkdir(exist_ok=True)
+log_file = log_dir / 'log.txt'
 
 # Start / Resume Training
 if resume_training:
     # get latest checkpoint file
-    checkpoint_files = [f for f in os.listdir(log_dir) if f.startswith("model_") and f.endswith(".pt")]
+    checkpoint_files = [f for f in log_dir.iterdir() if f.startswith("model_") and f.endswith(".pt")]
     assert len(checkpoint_files) > 0, "no checkpoints found"
     checkpoint_files = sorted(checkpoint_files)
     last_checkpoint = checkpoint_files[-1]
-    checkpoint_path = os.path.join(log_dir, last_checkpoint)
+    checkpoint_path = log_dir / last_checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
     # load model state
     model = GPT(checkpoint['config'])
     model.to(device)
     model.load_state_dict(checkpoint['model'])
     # load optimizer state
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type, verbose=master_process)
     optimizer.load_state_dict(checkpoint['optimizer'])
     # load step (which will also load learning rate)
     current_step = checkpoint['step'] + 1
@@ -119,7 +149,7 @@ else:
     model = GPT(GPTConfig(vocab_size=vocab_size))
     model.to(device)
     current_step = 0
-    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type)
+    optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device_type=device_type, verbose=master_process)
     # clear the log file
     with open(log_file, "w") as f: # open for writing to clear the file
         pass
@@ -182,7 +212,7 @@ for step in range(max_steps):
                 # write model checkpoints
                 train_loader_checkpoint = {'current_shard': train_loader.current_shard,
                                            'current_position': train_loader.current_position}
-                checkpoint_path = os.path.join(log_dir, f'model_{step:05d}.pt')
+                checkpoint_path = log_dir / f'model_{step:05d}.pt'
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -193,9 +223,13 @@ for step in range(max_steps):
 
                 }
                 torch.save(checkpoint, checkpoint_path)
+                if use_huggingface:
+                    futures.append(
+                        upload(api=hf_api, file_path=checkpoint_path, model_repo=model_repo)
+                    )
 
     # evaluate hellaswag
-    if step % eval_interval == 0 or last_step:
+    if hellaswag_eval and (step % eval_interval == 0 or last_step):
         num_correct_norm = 0
         num_total = 0
         # Use unwrapped (uncompiled) model for evaluation
@@ -276,6 +310,10 @@ for step in range(max_steps):
         print(f"step: {step:5d} | loss: {loss_accum.item():.6f} | lr: {lr:.4e} | norm: {norm:.4f} | dt: {dt*1000:.2f}ms | tok/s: {tokens_per_sec:.2f}")
         with open(log_file, "a") as f:
             f.write(f"{step} train {loss_accum.item():.6f}\n")
+
+if use_huggingface and master_process:
+    for future in futures:
+        future.result()  # wait for upload to complete
 
 if ddp:
     destroy_process_group()
