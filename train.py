@@ -35,10 +35,10 @@ max_lr = 6e-4 * 2  # gpt-3 paper: 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 200  # gpt-3 paper: 715
 max_steps = 6  # 19073
-eval_interval = 5  # 250
+eval_interval = 250
 validation_steps = 20
 hellaswag_eval = True
-checkpoint_interval = 5  # 5000
+checkpoint_interval = 5000
 # -----------------------------------------------------------------------------
 
 
