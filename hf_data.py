@@ -18,7 +18,7 @@ def download(dataset_repo, dataset_dir):
         repo_id=dataset_repo,
         repo_type="dataset",
         local_dir=dataset_dir,
-        allow_patterns=["*000000.npy", "*000001.npy", "*000002.npy"]  # DEBUG
+        # allow_patterns=["*000000.npy", "*000001.npy", "*000002.npy"]  # DEBUG
     )
 
 def upload(api, file_path, model_repo, silent=False):

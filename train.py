@@ -25,7 +25,7 @@ model_repo = "mhonsel/gpt2_124M"
 # -----------------------------------------------------------------------------
 # hyperparameters
 total_batch_size = 524288  # 2**19, ~0.5M in number of tokens
-B = 16  # micro batch size (per GPU, make as big as GPU can handle)
+B = 64  # micro batch size (per GPU, make as big as GPU can handle)
 T = 1024  # sequence length
 vocab_size = 50304 # increase vocab_size to make a nice number
 log_dir = "log"
@@ -34,7 +34,7 @@ use_compile = True
 max_lr = 6e-4 * 2  # gpt-3 paper: 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 200  # gpt-3 paper: 715
-max_steps = 6  # 19073
+max_steps = 19073
 eval_interval = 250
 validation_steps = 20
 hellaswag_eval = True
